@@ -152,12 +152,17 @@ class TraceProbe extends Probe {
 		var out = Trace.OUT;
 		var len = out.length;
 		var accessor = frame.getFrameAccessor();
+
+		var instrBuf = StringBuilder.new();
+
 		out.pad(' ', len + 2 * accessor.depth());
+		out.puts(TermColors.GREEN);
 		out.putc('+').putd(offset).puts(": ");
+		out.puts(TermColors.DEFAULT);
 
 		var opcode = codeptr.data[codeptr.pos];
 		if (opcode == InternalOpcode.PROBE.code) {
-			out.puts("<probe> ");
+			instrBuf.puts("<probe> ");
 			var prev = (codeptr.data, codeptr.pos, codeptr.limit);
 			codeptr.reset(func.decl.orig_bytecode, prev.1, prev.2);
 			tracer.putInstr(out, module, codeptr);
@@ -165,6 +170,8 @@ class TraceProbe extends Probe {
 		} else {
 			tracer.putInstr(out, module, codeptr);
 		}
+		out.pad(' ', len + 40);
+		
 		if (Trace.operands) {
 			for (i < accessor.numLocals()) {
 				accessor.getLocal(i).render(out.sp());
