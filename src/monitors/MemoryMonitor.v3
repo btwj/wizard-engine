@@ -4,15 +4,20 @@
 // Implements a simple monitor that probes memory accesses within a certain range
 class MemoryMonitor extends Monitor {
     var range: (u64, u64);
-    var hits: Array<int>;
+    var loads: Array<int>;
+    var stores: Array<int>;
 
-    // format: --monitors=memory{0,4} reports accesses to bytes 0-3
+    // format: --monitors=memory{0,4} reports loads and stores to bytes 0-3
+    // memory range is in hex
 	def configure(args: string) -> string {
-        var parseResult = Ints.parseDecimal(args, 0);
+        var parseResult = Ints.parseHex(args, 0);
         var start = parseResult.1;
-        var end = Ints.parseDecimal(args, parseResult.0 + 1).1;
+        var end = Ints.parseHex(args, parseResult.0 + 1).1;
         range = (u64.!(start), u64.!(end));
-        hits = Array<int>.new(int.!(range.1 - range.0));
+        var length = int.!(range.1 - range.0);
+
+        loads = Array<int>.new(length);
+        stores = Array<int>.new(length);
 		return null;
 	}
     def onParse(module: Module) {
@@ -29,33 +34,47 @@ class MemoryMonitor extends Monitor {
             }
         }
     }
+    def renderRow(rowStart: u64, array: Array<int>) {
+        for (j < 8) {
+            var cur = rowStart + u64.!(j);
+            if (j > 0) Trace.OUT.putc(' ');
+
+            if (cur < range.0 || cur >= range.1) {
+                Trace.OUT.puts(TermColors.DARKGRAY);
+                Trace.OUT.puts("?");
+                Trace.OUT.puts(TermColors.DEFAULT);
+            } else {
+                Trace.OUT.put1("%d", array[cur - range.0]);
+            }
+        }
+    }
     def onFinish(i: Instance) {
         for (rowStart = range.0 - (range.0 % 8); rowStart < range.1; rowStart += 8) {
             Trace.OUT.puts(TermColors.CYAN);
-            Trace.OUT.put1("[%d] ", rowStart);
+            Trace.OUT.put1("[%x] ", rowStart);
             Trace.OUT.puts(TermColors.DEFAULT);
 
-            for (j < 8) {
-                var cur = rowStart + u64.!(j);
-                if (j > 0) Trace.OUT.putc(' ');
-
-                if (cur < range.0 || cur >= range.1) {
-                    Trace.OUT.puts(TermColors.DARKGRAY);
-                    Trace.OUT.puts("X");
-                    Trace.OUT.puts(TermColors.DEFAULT);
-                } else {
-                    Trace.OUT.put1("%d", hits[cur - range.0]);
-                }
-            }
+            renderRow(rowStart, loads);
+            var length = Trace.OUT.length;
+            Trace.OUT.pad(' ', length + 5);
+            renderRow(rowStart, stores);
             Trace.OUT.outln();
         }
 	}
 
-    def hit(address: u64, size: u8) {
+    def hit(address: u64, size: u8, isLoad: bool) {
+        // TODO: make more efficient by storing deltas instead
+        // +1 at address and -1 at address + size
         for (i < size) {
             var newAddress = address + i;
-            if (newAddress >= range.0 && newAddress < range.1)
-                hits[newAddress - range.0]++;
+            if (newAddress >= range.0 && newAddress < range.1) {
+                var index = newAddress - range.0;
+                if (isLoad) {
+                    loads[index]++;
+                } else {
+                    stores[index]++;
+                }
+            }       
         }
     }
 }
@@ -73,7 +92,7 @@ class MemoryMonitorVisitor(m: MemoryMonitor, module: Module) extends BytecodeVis
             I64_LOAD, F64_LOAD => size = 8;
             _ => ;
         }
-        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size));
+        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size, true));
     }
     def visitStore(op: Opcode, imm: MemArg) {
         var size: u8 = 0;
@@ -85,17 +104,17 @@ class MemoryMonitorVisitor(m: MemoryMonitor, module: Module) extends BytecodeVis
             I64_STORE, F64_STORE => size = 8;
             _ => ;
         }
-        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size));
+        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size, false));
     }
 }
 
-class MemoryProbe(m: MemoryMonitor, imm: MemArg, size: u8) extends Probe {
+class MemoryProbe(m: MemoryMonitor, imm: MemArg, size: u8, isLoad: bool) extends Probe {
     def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
         var accessor = frame.getFrameAccessor();
         var address: u64 = u64.!(Values.v_i(accessor.getOperand(0)));
         address += imm.offset;
 
-        if (address >= m.range.0 && address < m.range.1) m.hit(address, size);
+        if (address >= m.range.0 && address < m.range.1) m.hit(address, size, isLoad);
         return Resumption.Continue;
     }
 }
