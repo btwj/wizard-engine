@@ -1,0 +1,101 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a simple monitor that probes memory accesses within a certain range
+class MemoryMonitor extends Monitor {
+    var range: (u64, u64);
+    var hits: Array<int>;
+
+    // format: --monitors=memory{0,4} reports accesses to bytes 0-3
+	def configure(args: string) -> string {
+        var parseResult = Ints.parseDecimal(args, 0);
+        var start = parseResult.1;
+        var end = Ints.parseDecimal(args, parseResult.0 + 1).1;
+        range = (u64.!(start), u64.!(end));
+        hits = Array<int>.new(int.!(range.1 - range.0));
+		return null;
+	}
+    def onParse(module: Module) {
+        var it = BytecodeIterator.new();
+        var visitor = MemoryMonitorVisitor.new(this, module);
+        visitor.bi = it;
+
+        for (i < module.functions.length) {
+            var f = module.functions[i];
+			if (f.imp != null) continue;
+
+            for (bi = it.reset(f); bi.more(); bi.next()) {
+                bi.dispatch(visitor);
+            }
+        }
+    }
+    def onFinish(i: Instance) {
+        for (rowStart = range.0 - (range.0 % 8); rowStart < range.1; rowStart += 8) {
+            Trace.OUT.puts(TermColors.CYAN);
+            Trace.OUT.put1("[%d] ", rowStart);
+            Trace.OUT.puts(TermColors.DEFAULT);
+
+            for (j < 8) {
+                var cur = rowStart + u64.!(j);
+                if (j > 0) Trace.OUT.putc(' ');
+
+                if (cur < range.0 || cur >= range.1) {
+                    Trace.OUT.puts(TermColors.DARKGRAY);
+                    Trace.OUT.puts("X");
+                    Trace.OUT.puts(TermColors.DEFAULT);
+                } else {
+                    Trace.OUT.put1("%d", hits[cur - range.0]);
+                }
+            }
+            Trace.OUT.outln();
+        }
+	}
+
+    def hit(address: u64, size: u8) {
+        for (i < size) {
+            var newAddress = address + i;
+            if (newAddress >= range.0 && newAddress < range.1)
+                hits[newAddress - range.0]++;
+        }
+    }
+}
+
+class MemoryMonitorVisitor(m: MemoryMonitor, module: Module) extends BytecodeVisitor {
+    var bi: BytecodeIterator;
+
+    def visitLoad(op: Opcode, imm: MemArg) {
+        var size: u8 = 0;
+        match (op) {
+            // TODO: V128, ATOMIC ops
+            I32_LOAD8_S, I32_LOAD8_U, I64_LOAD8_S, I64_LOAD8_U => size = 1;
+            I32_LOAD16_S, I32_LOAD16_U, I64_LOAD16_S, I64_LOAD16_U => size = 2;
+            I32_LOAD, I64_LOAD32_S, I64_LOAD32_U => size = 4;
+            I64_LOAD, F64_LOAD => size = 8;
+            _ => ;
+        }
+        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size));
+    }
+    def visitStore(op: Opcode, imm: MemArg) {
+        var size: u8 = 0;
+        match (op) {
+            // TODO: V128, ATOMIC ops
+            I32_STORE8, I64_STORE8 => size = 1;
+            I32_STORE16, I64_STORE16 => size = 2;
+            I32_STORE, I64_STORE32, F32_STORE => size = 4;
+            I64_STORE, F64_STORE => size = 8;
+            _ => ;
+        }
+        module.insertProbeAt(bi.func.func_index, bi.pc, MemoryProbe.new(m, imm, size));
+    }
+}
+
+class MemoryProbe(m: MemoryMonitor, imm: MemArg, size: u8) extends Probe {
+    def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+        var accessor = frame.getFrameAccessor();
+        var address: u64 = u64.!(Values.v_i(accessor.getOperand(0)));
+        address += imm.offset;
+
+        if (address >= m.range.0 && address < m.range.1) m.hit(address, size);
+        return Resumption.Continue;
+    }
+}
