@@ -1,0 +1,384 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class DebugMonitor extends Monitor {
+	def configure(args: string) -> string {
+		return null;
+	}
+	def onInstantiate(i: Instance) {
+		Debugger.init(i);
+		Debugger.query();
+	}
+}
+
+type DbgCommand {
+	case Run;
+	case Step;
+	case Next;
+	case Info(info: Info);
+	case Breakpoint(breakpoint: Breakpoint);
+	case DeleteBreakpoint(index: int);
+	case Backtrace;
+	case Continue;
+	case List;
+	case Unknown(cmd: string);
+	case Set(local_idx: int, value: Value);
+}
+
+type Info {
+	case Breakpoints;
+	case Locals;
+	case Invalid(args: string);
+}
+
+type Breakpoint {
+	case FunctionEnter(func_index: int) {
+		def render(out: StringBuilder) -> StringBuilder {
+			return out.put1("#%d enter", func_index);
+		}
+	}
+	case FunctionPc(func_index: int, pc: int) {
+		def render(out: StringBuilder) -> StringBuilder {
+			return out.put2("#%d+%d", func_index, pc);
+		}
+	}
+	case Invalid(args: string) {
+		def render(out: StringBuilder) -> StringBuilder {
+			return out.puts(args);
+		}
+	}
+
+	def render(out: StringBuilder) -> StringBuilder;
+}
+
+class DebuggerParser {
+	def STDIN = 0;
+
+	def getCommand() -> string {
+		var sb = StringBuilder.new();
+		System.puts("(debugger) ");
+		
+		var ch = byte.!(System.fileRead(STDIN));
+		while (ch != '\n') {
+			sb.putc(ch);
+			ch = byte.!(System.fileRead(STDIN));
+		}
+		return sb.extract();
+	}
+	def parseCommand(command: string) -> DbgCommand {
+		var name: string;
+		var args: string;
+		for (i < command.length) {
+			if (command[i] == ' ') {
+				name = Arrays.range(command, 0, i);
+				args = Arrays.range(command, i + 1, command.length);
+				break;
+			}
+
+			if (i == command.length - 1) name = command;
+		}
+
+		if (name == null) {
+			return DbgCommand.Unknown("");
+		} else if (Strings.equal(name, "run")) {
+			return DbgCommand.Run;
+		} else if (Strings.equal(name, "step") || Strings.equal(name, "s")) {
+			return DbgCommand.Step;
+		} else if (Strings.equal(name, "next") || Strings.equal(name, "n")) {
+			return DbgCommand.Next;
+		} else if (Strings.equal(name, "breakpoint") || Strings.equal(name, "b")) {
+			return DbgCommand.Breakpoint(parseBreakpoint(args));
+		} else if (Strings.equal(name, "continue") || Strings.equal(name, "c")) {
+			return DbgCommand.Continue;
+		} else if (Strings.equal(name, "list") || Strings.equal(name, "l")) {
+			return DbgCommand.List;
+		} else if (Strings.equal(name, "info")) {
+			return DbgCommand.Info(parseInfo(args));
+		} else if (Strings.equal(name, "del") || Strings.equal(name, "d")) {
+			return DbgCommand.DeleteBreakpoint(Ints.parseDecimal(args, 0).1);
+		} else if (Strings.equal(name, "backtrace") || Strings.equal(name, "bt")) {
+			return DbgCommand.Backtrace;
+		} else if (Strings.equal(name, "set")) {
+			return parseSet(args);
+		}
+		return DbgCommand.Unknown(command);
+	}
+	def parseBreakpoint(args: string) -> Breakpoint {
+		if (args[0] != '#') return Breakpoint.Invalid(args);
+		var result = Ints.parseDecimal(args, 1);
+		var func_index = result.1;
+		if (result.0 + 1 == args.length) {
+			return Breakpoint.FunctionEnter(func_index);
+		} else {
+			if (args[result.0 + 1] != '+') return Breakpoint.Invalid(args);
+			var pc = Ints.parseDecimal(args, result.0 + 2).1;
+			return Breakpoint.FunctionPc(func_index, pc);
+		}
+	}
+	def parseInfo(args: string) -> Info {
+		if (Strings.equal(args, "break")) {
+			return Info.Breakpoints;
+		} else if (Strings.equal(args, "locals")) {
+			return Info.Locals;
+		}
+		return Info.Invalid(args);
+	}
+	def parseSet(args: string) -> DbgCommand {
+		for (i < args.length) {
+			if (args[i] == ' ') {
+				var local_idx = Ints.parseDecimal(args, 0).1;
+				var value = parseSetValue(Arrays.range(args, i + 1, args.length));
+				return DbgCommand.Set(local_idx, value);
+			}
+		}
+		return DbgCommand.Unknown(args);
+	}
+	def parseSetValue(args: string) -> Value {
+		var typ: string;
+		var valueStr: string;
+		for (i < args.length) {
+			if (args[i] == ' ') {
+				typ = Arrays.range(args, 0, i);
+				valueStr = Arrays.range(args, i + 1, args.length);
+				break;
+			}
+		}
+
+		var value: Value = Value.I32(0);
+		if (Strings.equal(typ, "i32")) {
+			value = Value.I32(u32.view(Ints.parseDecimal(valueStr, 0).1));
+		} else if (Strings.equal(typ, "i64")) {
+			value = Value.I64(u64.view(Longs.parseDecimal(valueStr, 0)));
+		}
+		return value;
+	}
+}
+
+component Debugger {
+	def tracer = InstrTracer.new();
+	def codeptr = DataReader.new([]);
+	def bi = BytecodeIterator.new();
+	def parser = DebuggerParser.new();
+
+	def var stepped = false;
+	def var running = false;
+	def var stepOnce = false;
+	def stepProbe: DebugProbe = DebugProbe.new();
+	def nextProbe: DebugOnceProbe = DebugOnceProbe.new();
+
+	def breakpoints = Vector<(Breakpoint, Probe)>.new();
+	var state: ProbeFrame;
+	var instance: Instance;
+	var module: Module;
+
+	def init(i: Instance) {
+		instance = i;
+		module = i.module;
+	}
+
+	def stepMode(step: bool) {
+		if (!stepped && step) {
+			stepped = step;
+			Execute.probes.add(stepProbe);
+		} else if (stepped && !step) {
+			Execute.probes.remove(stepProbe);
+			stepped = step;
+		}
+	}
+	// return true if we don't continue execution and query again
+	def handleCommand(command: DbgCommand) -> bool {
+		match (command) {
+			Run => return false;
+			Step => {
+				stepMode(true);
+				return false;
+			}
+			Next => {
+				if (state.func == null) {
+					stepMode(true);
+					return false;
+				}
+				var it = bi.reset(state.func.decl);
+				it.skipToPc(state.pc);
+				var op = bi.current();
+				match (op) {
+					CALL, CALL_INDIRECT => {
+						it.next();
+						module.insertProbeAt(state.func.decl.func_index, it.pc, DebugOnceProbe.new());
+						stepMode(false);
+					}
+					_ => {
+						stepOnce = true;
+						stepMode(true);
+					}
+				}
+				return false;
+			}
+			Breakpoint(breakpoint) => {
+				match (breakpoint) {
+					FunctionEnter(func_idx) => {
+						Trace.OUT.put1("set breakpoint at %q", breakpoint.render).outln();
+						var probe = DebugProbe.new();
+						breakpoints.put((breakpoint, probe));
+						module.insertProbeAtFuncEnter(func_idx, probe);
+					}
+					FunctionPc(func_idx, pc) => {
+						Trace.OUT.put1("set breakpoint at %q", breakpoint.render).outln();
+						var probe = DebugProbe.new();
+						breakpoints.put((breakpoint, probe));
+						module.insertProbeAt(func_idx, pc, probe);
+					}
+					Invalid(args) => {
+						Trace.OUT.put1("invalid breakpoint syntax: %s", args).outln();
+					}
+				}
+				return true;
+			}
+			DeleteBreakpoint(index) => {
+				var breakpoint = breakpoints[index].0;
+				var probe = breakpoints[index].1;
+				Trace.OUT.put1("delete breakpoint at %q", breakpoint.render).outln();
+				match (breakpoint) {
+					FunctionEnter(func_idx) => {
+						module.removeProbeAtFuncEnterExit(func_idx, probe, null);
+					}
+					FunctionPc(func_idx, pc) => {
+						module.removeProbeAt(func_idx, pc, probe);
+					}
+					_ => ;
+				}
+				Vectors.overwrite(breakpoints, Arrays.deleteAt(breakpoints.extract(), index));
+				return true;
+			}
+			List => {
+				list();
+				return true;
+			}
+			Continue => {
+				stepMode(false);
+				return false;
+			}
+			Info(info) => {
+				match (info) {
+					Breakpoints => {
+						for (i < breakpoints.length) {
+							Trace.OUT.put2("%d: %q", i, breakpoints[i].0.render).outln();
+						}
+					}
+					Locals => {
+						if (state.func != null) {
+							var accessor = state.frame.getFrameAccessor();
+							for (i < accessor.numLocals()) {
+								var local = accessor.getLocal(i);
+								Trace.OUT.put2("local[%d] = %q", i, local.render).outln();
+							}
+						}
+					}
+					Invalid(args) => {
+						Trace.OUT.put1("invalid info args: %s", args).outln();
+					}
+				}
+				return true;
+			}
+			Set(local_idx, value) => {
+				if (state.func != null) {
+					var accessor = state.frame.getFrameAccessor();
+					Trace.OUT.put2("set local[%d] := %q", local_idx, value.render).outln();
+					accessor.setLocal(local_idx, value);
+				}
+				return true;
+			}
+			Backtrace => {
+				if (state.func == null) {
+					Trace.OUT.puts("no program running").outln();
+					return true;
+				}
+
+				var depth = 0;
+				var curState = state;
+				while (curState.func != null) {
+					Trace.OUT.put1("%d: ", depth);
+					Debugger.renderState(curState);
+					var accessor = curState.frame.getFrameAccessor();
+					curState = accessor.caller();
+					depth++;
+				}
+				return true;
+			}
+			Unknown(cmd) => {
+				Trace.OUT.put1("unknown command: '%s'", cmd).outln();
+				return true;
+			}
+		}
+	}
+
+	def query() {
+		var command: DbgCommand;
+		var queryAgain = true;
+		while (queryAgain) {
+			command = parser.parseCommand(parser.getCommand());
+			queryAgain = handleCommand(command);
+		}
+	}
+	def renderState(pf: ProbeFrame) {
+		codeptr.reset(pf.func.decl.orig_bytecode, pf.pc, pf.func.decl.orig_bytecode.length);
+		Trace.OUT.puts(TermColors.CYAN);
+		pf.func.decl.render(module.names, Trace.OUT);
+		Trace.OUT.puts(TermColors.DEFAULT);
+		Trace.OUT.put2(" #%d+%d: ", pf.func.decl.func_index, pf.pc);
+		tracer.putInstr(Trace.OUT, module, codeptr);
+		Trace.OUT.puts(TermColors.DEFAULT);
+		Trace.OUT.outln();
+	}
+	def list() {
+		if (state.func == null) {
+			Trace.OUT.puts("no program running").outln();
+			return;
+		}
+
+		var it = bi.reset(state.func.decl);
+		it.skipToPc(state.pc);
+
+		Trace.OUT.puts(TermColors.CYAN);
+		state.func.decl.render(module.names, Trace.OUT);
+		Trace.OUT.puts(TermColors.DEFAULT);
+		Trace.OUT.outln();
+
+		var instrs = 0;
+		var curInstr: int = -1;
+		while (it.more()) {
+			if (it.pc == state.pc) {
+				Trace.OUT.puts(TermColors.GREEN).puts(" => ");
+				curInstr = instrs;
+			} else {
+				Trace.OUT.puts("    ");
+			}
+
+			var length = Trace.OUT.length;
+			Trace.OUT.put1("+%d: ", it.pc);
+			Trace.OUT.pad(' ', length + 6);
+			it.traceOrig(Trace.OUT, module, tracer);
+
+			if (it.pc == state.pc) Trace.OUT.puts(TermColors.DEFAULT);
+			Trace.OUT.outln();
+			if (curInstr != -1 && instrs > curInstr + 10) {
+				Trace.OUT.puts("    ...").outln();
+				break;
+			}
+			instrs++;
+			it.next();
+		}
+	}
+	def pause(func: WasmFunction, pc: int, frame: TargetFrame) {
+		if (state.func != null && state.func == func && state.pc == pc) return;
+		if (stepOnce) {
+			stepOnce = false;
+			stepMode(false);
+		}
+		state = ProbeFrame(func, pc, frame);
+		Trace.OUT.puts(TermColors.LIGHTGRAY);
+		Trace.OUT.puts("paused at ");
+		renderState(state);
+		query();
+	}
+}

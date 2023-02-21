@@ -20,19 +20,22 @@ private class FuncWithLoopExitProbe(probe: Probe, frameAccessors: ListStack<Fram
 }
 
 component FuncMonitorUtil {
-	def probeOnEnterExitFunc(module: Module, func: FuncDecl, enterProbe: Probe, exitProbe: Probe) {
+	def insertProbeAtFuncEnterExit(module: Module, func: FuncDecl, enterProbe: Probe, exitProbe: Probe) -> (Probe, Probe) {
 		var it = BytecodeIterator.new();
 		var bi = it.reset(func);
 
 		var startsWithLoop = false;
 		var frameAccessors: ListStack<FrameAccessor>;
+		var newEnterProbe = enterProbe;
 		if (bi.current() == Opcode.LOOP) {
 			startsWithLoop = true;
 			frameAccessors = ListStack<FrameAccessor>.new();
-			module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopEnterProbe.new(enterProbe, frameAccessors));
-		} else if (enterProbe != null) {
-			module.insertProbeAt(func.func_index, bi.pc, enterProbe);
+			newEnterProbe = FuncWithLoopEnterProbe.new(enterProbe, frameAccessors);
 		}
+		if (newEnterProbe != null) module.insertProbeAt(func.func_index, bi.pc, newEnterProbe);
+
+		var newExitProbe = exitProbe;
+		if (startsWithLoop) newExitProbe = FuncWithLoopExitProbe.new(exitProbe, frameAccessors);
 
 		for (bi = it.reset(func); bi.more(); bi.next()) {
 			var op = bi.current();
@@ -42,11 +45,27 @@ component FuncMonitorUtil {
 				_ => continue;
 			}
 
-			if (startsWithLoop) {
-				module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopExitProbe.new(exitProbe, frameAccessors));
-			} else if (exitProbe != null) {
-				module.insertProbeAt(func.func_index, bi.pc, exitProbe);
+			if (newExitProbe != null) module.insertProbeAt(func.func_index, bi.pc, newExitProbe);
+		}
+
+		return (newEnterProbe, newExitProbe);
+	}
+
+	def removeProbeAtFuncEnterExit(module: Module, func: FuncDecl, enterProbe: Probe, exitProbe: Probe) {
+		var it = BytecodeIterator.new();
+		var bi = it.reset(func);
+		bi.current();
+		if (enterProbe != null) module.removeProbeAt(func.func_index, bi.pc, enterProbe);
+
+		for (bi = it.reset(func); bi.more(); bi.next()) {
+			var op = bi.current();
+			match (op) {
+				RETURN => ;
+				END => if (bi.pc + 1 < bi.func.cur_bytecode.length) continue;
+				_ => continue;
 			}
+
+			if (exitProbe != null) module.removeProbeAt(func.func_index, bi.pc, exitProbe);
 		}
 	}
 }

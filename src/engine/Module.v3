@@ -128,16 +128,22 @@ class Module(filename: string) {
 		if (list.elem == null) functions[func_id].unprobeAt(offset);
 	}
 	// Insert a probe that is fired when a function is called
-	def insertProbeAtFuncEnter(func_id: int, p: Probe) {
-		FuncMonitorUtil.probeOnEnterExitFunc(this, this.functions[func_id], p, null);
+	// Returns the inserted probe, which may have been wrapped for functions starting with loops
+	def insertProbeAtFuncEnter(func_id: int, p: Probe) -> Probe {
+		return FuncMonitorUtil.insertProbeAtFuncEnterExit(this, this.functions[func_id], p, null).0;
 	}
 	// Insert a probe that is fired when a function is exited
-	def insertProbeAtFuncExit(func_id: int, p: Probe) {
-		FuncMonitorUtil.probeOnEnterExitFunc(this, this.functions[func_id], null, p);
+	// Returns the inserted probe, which may have been wrapped for functions starting with loops
+	def insertProbeAtFuncExit(func_id: int, p: Probe) -> Probe {
+		return FuncMonitorUtil.insertProbeAtFuncEnterExit(this, this.functions[func_id], null, p).1;
 	}
 	// Insert probes that are fired when a function is entered and exited
-	def insertProbeAtFuncEnterExit(func_id: int, enterProbe: Probe, exitProbe: Probe) {
-		FuncMonitorUtil.probeOnEnterExitFunc(this, this.functions[func_id], enterProbe, exitProbe);
+	// Returns the inserted probes, which may have been wrapped for functions starting with loops
+	def insertProbeAtFuncEnterExit(func_id: int, enterProbe: Probe, exitProbe: Probe) -> (Probe, Probe) {
+		return FuncMonitorUtil.insertProbeAtFuncEnterExit(this, this.functions[func_id], enterProbe, exitProbe);
+	}
+	def removeProbeAtFuncEnterExit(func_id: int, enterProbe: Probe, exitProbe: Probe) {
+		FuncMonitorUtil.removeProbeAtFuncEnterExit(this, this.functions[func_id], enterProbe, exitProbe);
 	}
 }
 
