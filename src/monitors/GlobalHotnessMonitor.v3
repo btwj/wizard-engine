@@ -1,0 +1,124 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a monitor that computes various measures of hotness of the program.
+class GlobalHotnessMonitor extends Monitor {
+	var counters: Array<Array<LocCounter>>;
+	var hotness: HotnessData;
+
+	def onParse(m: Module) {
+		Trace.OUT.puts("test").outln();
+		var it = BytecodeIterator.new();
+		hotness = HotnessData.new(m);
+		counters = Array.new(m.functions.length);
+
+		for (i < m.functions.length) {
+			var f = m.functions[i];
+			if (f.imp != null) continue;
+			counters[i] = Array.new(f.orig_bytecode.length);
+			for (bi = it.reset(f); bi.more(); bi.next()) {
+				var c = hotness.addCounter(f, bi.current(), bi.pc);
+				counters[i][bi.pc] = c;
+			}
+		}
+	}
+	def onInstantiate(i: Instance) {
+		Instrumentation.probes.add(GlobalHotnessProbe.new(counters));
+	}
+	def onExit(code: int) {
+		onFinish(null);
+	}
+	def onFinish(i: Instance) {
+		hotness.report();
+	}
+}
+class GlobalHotnessProbe(counters: Array<Array<LocCounter>>) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		counters[dynamicLoc.func.decl.func_index][dynamicLoc.pc].count++;
+		return Resumption.Continue;
+	}
+}
+
+def OUT = Trace.OUT;
+private class HotnessData(m: Module) {
+	def counters = Vector<LocCounter>.new();
+	var thresholds = [0.5d, 0.75d, 0.9d, 0.95d, 0.99d, 1d];
+	def spectrum = Palette.spectrum;
+
+	def addCounter(f: FuncDecl, op: Opcode, pc: int) -> LocCounter {
+		var p = LocCounter.new(f, pc, op, 0);
+		counters.put(p);
+		return p;
+	}
+
+	def initialize(sort: bool) -> Array<LocCounter> {
+		var result = if(sort, counters.extract(), counters.copy());
+		result = Arrays.sort(result, 0, result.length, LocCounter.compare);
+		var total = 0uL;
+		for (r in result) total += r.count;
+		var sum = 0uL;
+		var t = 0;
+		var threshold = u64.truncd(thresholds[t] * double.roundi(total));
+
+		for (i < result.length) {
+			var r = result[i];
+			r.group = t; // set hotness group
+			sum += r.count;
+			if (sum >= threshold) {
+				t++;
+				if (t >= thresholds.length) threshold = u64.max;
+				else threshold = u64.truncd(thresholds[t] * double.roundi(total));
+			}
+		}
+
+		return result;
+	}
+
+	def report() {
+		var result = initialize(true);
+
+		for (i < result.length) {
+			var r = result[i];
+
+			var width = 25;
+			if (i > 0 && r.group > result[i-1].group) {
+				var t = result[i-1].group;
+				OUT.puts(spectrum[t]).puts(Palette.SEPARATOR);
+				var s1 = " %d instrs", s2 = "reach %d%";
+				OUT.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, s1, i)), 10)
+					.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, s2, u64.truncd(100*thresholds[t]))), width)
+					.puts(Palette.DEFAULT)
+					.outln();
+			}
+
+			var funcColor = if(r.count > 0, Palette.FUNC, Palette.UNREACHABLE);
+			var lineColor = if(r.count > 0, Palette.LNO, Palette.UNREACHABLE);
+
+			OUT.puts(funcColor)
+				.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "func %q", r.func.render(m.names, _))), 15)
+				.puts(Palette.DEFAULT)
+				.puts(lineColor)
+				.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", r.pc)), 5)
+				.puts(Palette.DEFAULT)
+				.putc(':')
+				.puts(spectrum[r.group])
+				.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.putd(_, r.count)), 14)
+				.puts(Palette.DEFAULT)
+				.outln();
+		}
+
+	}
+}
+
+private class LocCounter(func: FuncDecl, pc: int, op: Opcode, var group: int) {
+	var count: u64 = 0;
+
+	def compare(that: LocCounter) -> bool {
+		if (this.count > that.count) return true;
+		if (this.count < that.count) return false;
+		if (this.func.func_index < that.func.func_index) return true;
+		if (this.func.func_index > that.func.func_index) return false;
+		if (this.pc < that.pc) return true;
+		return false;
+	}
+}
