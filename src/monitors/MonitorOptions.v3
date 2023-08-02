@@ -18,6 +18,7 @@ enum MonitorOptionTest(op: string, monitor: Monitor) {
 	postInstr("_postInstr", PostInstructionTestTracer.new()),
 	hostCall("_hostCall", HostCallTestTracer.new()),
 	globalHotness("_globalHotness", GlobalHotnessMonitor.new()),
+	globalBranch("_globalBranches", GlobalBranchMonitor.new())
 }
 
 // Parses and updates monitor options based on arguments.
